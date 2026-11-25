@@ -97,8 +97,10 @@ impl OrderBook {
 
                         if maker.remaining <= 0 {
                             level.pop_front();
-                        } else {
-                            self.bids.insert(maker.price, maker);
+
+                            if level.is_empty() {
+                                entry.remove();
+                            }
                         }
 
                         return vec![new_trade];
