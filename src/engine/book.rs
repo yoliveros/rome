@@ -32,8 +32,11 @@ impl OrderBook {
             return Err(EngineError::InvalidPrice);
         }
 
+        let order_id = self.next_id;
+        let original_quantity = order.quantity;
+
         let mut new_order = Order {
-            id: self.next_id,
+            id: order_id,
             sequence: self.sequence,
             user_id: order.user_id,
             side: order.side,
@@ -41,83 +44,163 @@ impl OrderBook {
             remaining: order.quantity,
         };
 
-        match new_order.side {
-            Side::Buy => {
-                let trades = self.matching(Side::Buy, &mut new_order);
+        let trades = self.matching(new_order.side, &mut new_order);
 
-                self.bids
-                    .entry(new_order.price)
-                    .or_default()
-                    .push_back(new_order);
-            }
-            Side::Sell => {
-                let trades = self.matching(Side::Sell, &mut new_order);
+        let remaining = new_order.remaining;
+        let filled = original_quantity - remaining;
 
-                self.asks
-                    .entry(new_order.price)
-                    .or_default()
-                    .push_back(new_order);
+        if remaining > 0 {
+            match new_order.side {
+                Side::Buy => {
+                    self.bids
+                        .entry(new_order.price)
+                        .or_default()
+                        .push_back(new_order);
+                }
+                Side::Sell => {
+                    let trades = self.matching(Side::Sell, &mut new_order);
+
+                    self.asks
+                        .entry(new_order.price)
+                        .or_default()
+                        .push_back(new_order);
+                }
             }
         }
 
         self.sequence += 1;
-        let curr_id = self.next_id;
         self.next_id += 1;
 
+        let status = if remaining == 0 {
+            OrderStatus::Filled
+        } else if filled > 0 {
+            OrderStatus::PartiallyFilled
+        } else {
+            OrderStatus::Resting
+        };
+
         Ok(PlaceOutcome {
-            order_id: curr_id,
-            trades: vec![],
-            filled: 0,
-            remaining: order.quantity,
-            status: OrderStatus::Resting,
+            order_id,
+            trades,
+            filled,
+            remaining,
+            status,
         })
     }
 
     fn matching(&mut self, side: Side, order: &mut Order) -> Vec<Trade> {
-        match side {
-            Side::Buy => {
-                if order.remaining <= 0 {
-                    return vec![];
-                }
-                if let Some(mut entry) = self.asks.first_entry() {
-                    if entry.key() <= &order.price {
-                        let level = entry.get_mut();
-                        let maker = level.front_mut().unwrap();
-                        let fill = order.remaining.min(maker.remaining);
+        let mut trades = Vec::new();
 
-                        let new_trade = Trade {
-                            taker_order_id: order.id,
-                            maker_order_id: maker.id,
-                            price: maker.price,
-                            quantity: fill,
-                        };
+        while order.remaining > 0 {
+            match side {
+                Side::Buy => {
+                    let Some(mut entry) = self.asks.first_entry() else {
+                        break;
+                    };
 
-                        order.remaining -= fill;
-                        maker.remaining -= fill;
+                    if *entry.key() > order.price {
+                        break;
+                    }
 
-                        if maker.remaining <= 0 {
-                            level.pop_front();
+                    let level = entry.get_mut();
+                    let maker = level.front_mut().unwrap();
+                    let fill = order.remaining.min(maker.remaining);
 
-                            if level.is_empty() {
-                                entry.remove();
-                            }
-                        }
+                    trades.push(Trade {
+                        taker_order_id: order.id,
+                        maker_order_id: maker.id,
+                        price: maker.price,
+                        quantity: fill,
+                    });
 
-                        return vec![new_trade];
+                    order.remaining -= fill;
+                    maker.remaining -= fill;
+
+                    if maker.remaining == 0 {
+                        level.pop_front();
+                    }
+
+                    if level.is_empty() {
+                        entry.remove();
                     }
                 }
+                Side::Sell => {
+                    let Some(mut entry) = self.bids.last_entry() else {
+                        break;
+                    };
 
-                return vec![];
-            }
-            Side::Sell => {
-                let best_bid = self.bids.last_entry();
-                return vec![];
+                    if *entry.key() < order.price {
+                        break;
+                    }
+
+                    let level = entry.get_mut();
+                    let maker = level.front_mut().unwrap();
+                    let fill = order.remaining.min(maker.remaining);
+
+                    trades.push(Trade {
+                        taker_order_id: order.id,
+                        maker_order_id: maker.id,
+                        price: maker.price,
+                        quantity: fill,
+                    });
+
+                    order.remaining -= fill;
+                    maker.remaining -= fill;
+
+                    if maker.remaining == 0 {
+                        level.pop_front();
+                    }
+
+                    if level.is_empty() {
+                        entry.remove();
+                    }
+                }
             }
         }
+
+        trades
     }
 
     pub fn cancel(&mut self, id: OrderId) -> Result<Quantity, EngineError> {
-        todo!()
+        let bid_price = self
+            .bids
+            .iter()
+            .find(|(_, level)| level.iter().any(|order| order.id == id))
+            .map(|(price, _)| *price);
+
+        if let Some(price) = bid_price {
+            let level = self.bids.get_mut(&price).unwrap();
+            let position = level.iter().position(|order| order.id == id).unwrap();
+            let order = level.remove(position).unwrap();
+            let remaining = order.remaining;
+
+            if level.is_empty() {
+                self.bids.remove(&price);
+            }
+
+            return Ok(remaining);
+        }
+
+        let ask_price = self
+            .asks
+            .iter()
+            .find(|(_, level)| level.iter().any(|order| order.id == id))
+            .map(|(price, _)| *price);
+
+        if let Some(price) = ask_price {
+            let level = self.asks.get_mut(&price).unwrap();
+            let position = level.iter().position(|order| order.id == id).unwrap();
+            let order = level.remove(position).unwrap();
+            let remaining = order.remaining;
+
+            if level.is_empty() {
+                self.asks.remove(&price);
+            }
+
+            return Ok(remaining);
+        }
+
+        Err(EngineError::UnknownOrder)
     }
 
     pub fn best_bid(&self) -> Option<Price> {
